@@ -2,9 +2,12 @@ package client;
 
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javafx.animation.KeyFrame;
+import javafx.animation.Timeline;
 import javafx.application.Application;
 import static javafx.application.Application.launch;
 import javafx.beans.binding.Bindings;
@@ -12,6 +15,9 @@ import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.concurrent.Service;
+import javafx.concurrent.Task;
+import javafx.concurrent.WorkerStateEvent;
 import javafx.event.ActionEvent;
 import javafx.event.EventHandler;
 import javafx.geometry.Insets;
@@ -24,8 +30,8 @@ import javafx.scene.control.TextField;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+import javafx.util.Duration;
 import javax.websocket.ClientEndpointConfig;
-import javax.websocket.DeploymentException;
 import javax.websocket.Session;
 import org.glassfish.tyrus.client.ClientManager;
 
@@ -35,7 +41,10 @@ import org.glassfish.tyrus.client.ClientManager;
  * @author tomo
  */
 public class EchoClientFX extends Application {
-    private Session connectSession;
+
+    private BlockingQueue<String> queue = new LinkedBlockingDeque<>();
+    private EchoClientService service = new EchoClientService();
+    private Timeline timer;
     private ObservableList<String> messageList = FXCollections.observableArrayList();
     private BooleanProperty connectionProp = new SimpleBooleanProperty(false);
 
@@ -72,16 +81,30 @@ public class EchoClientFX extends Application {
         openBtn.setOnAction(new EventHandler<ActionEvent>() {
             @Override
             public void handle(ActionEvent event) {
-                ClientManager client = ClientManager.createClient();
-                ClientEndpointConfig cec = ClientEndpointConfig.Builder.create().build();
-                try {
-                    URI uri = new URI("ws://localhost:8080/ws/echo");
-                    // connect the echo server
-                    connectSession = client.connectToServer(new EchoClienEndpoint(messageList), cec, uri);
-                } catch (DeploymentException | URISyntaxException | IOException ex) {
-                    Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
-                }
-                connectionProp.setValue(true);
+                service.reset();
+                service.start();
+                timer = new Timeline(new KeyFrame(Duration.millis(100),
+                        new EventHandler<ActionEvent>() {
+                    @Override
+                    public void handle(ActionEvent t) {
+                        while (!queue.isEmpty()) {
+                            try {
+                                String message = queue.take();
+                                messageList.add(0, message);
+                            } catch (InterruptedException ex) {
+                                Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
+                            }
+                        }
+                    }
+                }));
+                timer.setCycleCount(Timeline.INDEFINITE);
+            }
+        });
+        service.setOnSucceeded(new EventHandler<WorkerStateEvent>() {
+            @Override
+            public void handle(WorkerStateEvent t) {
+                timer.play();
+                connectionProp.setValue(Boolean.TRUE);
             }
         });
     }
@@ -92,12 +115,8 @@ public class EchoClientFX extends Application {
         closeBtn.setOnAction(new EventHandler<ActionEvent>() {
             @Override
             public void handle(ActionEvent event) {
-                try {
-                    connectSession.close();
-                    connectionProp.setValue(false);
-                } catch (IOException ex) {
-                    Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
-                }
+                connectionProp.setValue(Boolean.FALSE);
+                service.closeSession();
             }
         });
     }
@@ -117,19 +136,61 @@ public class EchoClientFX extends Application {
         sendBtn.setOnAction(new EventHandler<ActionEvent>() {
             @Override
             public void handle(ActionEvent event) {
-                try {
-                    // send the message to the echo server
-                    connectSession.getBasicRemote().sendText(messageTxt.getText());
-                    messageTxt.clear();
-                } catch (IOException ex) {
-                    Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
-                }
+                service.sendText(messageTxt.getText());
+                messageTxt.clear();
             }
         });
         hbox.getChildren().addAll(messageLbl, messageTxt, sendBtn);
         return hbox;
     }
+
+    @Override
+    public void stop() throws Exception {
+        if (timer != null) {
+            timer.stop();
+        }
+        super.stop();
+    }
+
     public static void main(String[] args) {
         launch();
+    }
+
+    class EchoClientService extends Service<Session> {
+        private Session session;
+        @Override
+        protected Task<Session> createTask() {
+            Task<Session> task = new Task<Session>() {
+                @Override
+                protected Session call() throws Exception {
+                    ClientManager client = ClientManager.createClient();
+                    ClientEndpointConfig cec = ClientEndpointConfig.Builder.create().build();
+                    URI uri = new URI("ws://localhost:8080/ws/echo");
+                    session = client.connectToServer(new EchoClienEndpoint(queue), cec, uri);
+                    return session;
+                }
+            };
+            return task;
+        }
+
+        void sendText(String message) {
+            if (session != null) {
+                try {
+                    session.getBasicRemote().sendText(message);
+                } catch (IOException ex) {
+                    Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
+                }
+            }
+        }
+
+        void closeSession() {
+            if (session != null) {
+                try {
+                    session.close();
+                } catch (IOException ex) {
+                    Logger.getLogger(EchoClientFX.class.getName()).log(Level.SEVERE, null, ex);
+                }
+            }
+        }
     }
 }
